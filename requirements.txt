@@ -4,3 +4,4 @@ numpy
 matplotlib
 graphviz
 pydantic
+google-generativeai

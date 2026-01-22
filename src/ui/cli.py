@@ -3,7 +3,9 @@ Command-Line Interface (CLI) for the simulator.
 """
 import json
 import argparse
+from src.core.models import SystemModel
 from src.parsers.json_parser import JSONParser
+from src.parsers.llm_parser import LLMParser
 from src.engine.simulation_engine import SimulationEngine
 from src.engine.analyzer import Analyzer
 from src.ui.visualizer import generate_graph_visualization
@@ -13,7 +15,16 @@ def main_cli():
     Main function for the CLI.
     """
     parser = argparse.ArgumentParser(description="Battery Scenario Simulator CLI")
-    parser.add_argument("scenario_file", help="Path to the scenario JSON file.")
+    parser.add_argument(
+        "scenario_input",
+        help="Path to the scenario file or the natural language scenario as a string."
+    )
+    parser.add_argument(
+        "--parser",
+        choices=['json', 'llm'],
+        default='json',
+        help="The parser to use for the scenario input."
+    )
     parser.add_argument(
         "--mode",
         choices=['bfs', 'monte_carlo'],
@@ -34,18 +45,35 @@ def main_cli():
     args = parser.parse_args()
 
     print("--- Battery Scenario Simulator CLI ---")
-    print(f"Loading scenario from: {args.scenario_file}\n")
 
-    try:
-        with open(args.scenario_file, 'r', encoding='utf-8') as f:
-            json_data = f.read()
-    except FileNotFoundError:
-        print(f"Error: Example file not found at '{args.scenario_file}'")
-        return
+    system_model: SystemModel = None
 
     # 1. Parsing
-    json_parser = JSONParser()
-    system_model = json_parser.parse(json_data)
+    if args.parser == 'json':
+        print(f"Loading JSON scenario from: {args.scenario_input}\n")
+        try:
+            with open(args.scenario_input, 'r', encoding='utf-8') as f:
+                input_data = f.read()
+            parser = JSONParser()
+            system_model = parser.parse(input_data)
+        except FileNotFoundError:
+            print(f"Error: Scenario file not found at '{args.scenario_input}'")
+            return
+    elif args.parser == 'llm':
+        print("Parsing natural language scenario with LLM...")
+        # Check for API key
+        import os
+        if not os.environ.get("GOOGLE_API_KEY"):
+            print("\nError: The GOOGLE_API_KEY environment variable is not set.")
+            print("Please set it to your Gemini API key to use the LLM parser.")
+            return
+
+        parser = LLMParser()
+        system_model = parser.parse(args.scenario_input)
+
+    if not system_model or not system_model.name:
+        print("Failed to parse the model. Exiting.")
+        return
     print(f"Successfully parsed model: '{system_model.name}'")
     print(f" - States: {len(system_model.states)}")
     print(f" - Events: {len(system_model.events)}\n")
