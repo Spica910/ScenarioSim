@@ -7,6 +7,9 @@ This module is responsible for analyzing the results of a simulation run
 import networkx as nx
 from typing import List, Dict, Any, Tuple
 from src.core.models import SystemModel
+from src.utils import get_logger
+
+logger = get_logger(__name__)
 
 class Analyzer:
     """
@@ -26,9 +29,9 @@ class Analyzer:
         try:
             return eval(expression, {}, context)
         except SyntaxError as e:
-            print(f"Warning: Syntax error in expression '{expression}': {e}")
+            logger.warning("Syntax error in expression '%s': %s", expression, e)
             return False
-        except Exception as e:
+        except Exception:
             # print(f"Warning: Error evaluating expression '{expression}': {e}")
             return False
 

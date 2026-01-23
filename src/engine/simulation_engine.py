@@ -8,6 +8,9 @@ import random
 import networkx as nx
 from typing import Dict, Any, List, Tuple
 from src.core.models import SystemModel
+from src.utils import get_logger
+
+logger = get_logger(__name__)
 
 class SimulationEngine:
     """
@@ -52,11 +55,10 @@ class SimulationEngine:
         try:
             return eval(expression, {}, context)
         except SyntaxError as e:
-            print(f"Warning: Syntax error in condition '{expression}': {e}")
+            logger.warning("Syntax error in condition '%s': %s", expression, e)
             return False
-        except Exception as e:
+        except Exception:
             # Catch other potential runtime errors during evaluation
-            # print(f"Warning: Error evaluating condition '{expression}': {e}")
             return False
 
     def apply_event(self, state_dict: Dict[str, Any], event_name: str) -> Dict[str, Any]:
@@ -75,9 +77,9 @@ class SimulationEngine:
             # The exec function is used here to apply the state change.
             exec(event.effect, {}, new_state)
         except SyntaxError as e:
-            print(f"Warning: Syntax error in effect for event '{event_name}': {e}")
+            logger.warning("Syntax error in effect for event '%s': %s", event_name, e)
         except Exception as e:
-            print(f"Warning: Error applying effect for event '{event_name}': {e}")
+            logger.warning("Error applying effect for event '%s': %s", event_name, e)
 
         # Clean up internal variables created by exec
         if '__builtins__' in new_state:

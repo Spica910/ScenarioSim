@@ -1,7 +1,7 @@
 """
 Main entry point for the application.
 """
-from src.ui.cli import main_cli
+from src.ui.main_window import start_gui
 
 if __name__ == "__main__":
-    main_cli()
+    start_gui()

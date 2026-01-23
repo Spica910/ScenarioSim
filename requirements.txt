@@ -5,3 +5,4 @@ matplotlib
 graphviz
 pydantic
 google-generativeai
+PySide6
