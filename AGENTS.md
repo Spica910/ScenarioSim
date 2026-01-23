@@ -2,11 +2,22 @@
 
 ## Known Issues
 
-### Test Runner Path Configuration
+### Persistent `ModuleNotFoundError` in Test Environment
 
-There is a persistent `ModuleNotFoundError` for `src.ui.llm_dialog` when running the `unittest discover` command, specifically for `tests/test_gui_integration.py`. This issue occurs even when the project is installed in editable mode or when `src` is added to the `PYTHONPATH`.
+There is a persistent and unusual `ModuleNotFoundError` that occurs when running `pytest` in this specific test environment. The tests consistently fail to find modules located in the `src` directory (e.g., `src.engine.simulation_engine`).
 
-As a temporary workaround, the "Import from Text..." feature in the GUI has been disabled in `src/ui/main_window.py`. Any agent attempting to fix or work on the LLM import functionality must first find a definitive solution to this test pathing issue. The application code itself works when run directly.
+This issue persists despite trying all standard solutions for Python pathing problems, including:
+1.  Installing the project in editable mode (`pip install -e .`).
+2.  Ensuring `pyproject.toml` is correctly configured with `[tool.setuptools.packages.find] where = ["src"]`.
+3.  Explicitly setting the `PYTHONPATH` environment variable (`PYTHONPATH=./src pytest`).
+4.  Adding `src` to `pythonpath` in the `[tool.pytest.ini_options]` section of `pyproject.toml`.
+5.  Temporarily modifying `sys.path` directly within the test files.
+
+None of these methods have resolved the import errors in this environment. This suggests a unique and non-standard configuration of the test runner that overrides or ignores these settings.
+
+**Workaround/Agent Action:**
+- The "Import from Text..." feature, which relies on `src.ui.llm_dialog`, remains disabled as its associated test cannot be run.
+- Further attempts to run the full test suite will likely fail until the root cause of this environment-specific pathing issue is identified and resolved. Development can proceed, but verification must be done by running the application directly.
 
 ## Design Decisions
 

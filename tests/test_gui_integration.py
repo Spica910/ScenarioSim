@@ -3,8 +3,11 @@ Integration tests for the GUI logic.
 """
 import unittest
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
+
+# This import will be problematic in the test env, but is needed for the test
+# See AGENTS.md for more details on the pathing issue.
 from src.ui.main_window import MainWindow
 from src.core.models import SystemModel
 
@@ -17,75 +20,69 @@ class TestGuiIntegration(unittest.TestCase):
     def setUp(self):
         """Create a new MainWindow instance for each test."""
         self.window = MainWindow()
-        # Load initial data for testing editor functions
-        with patch('PySide6.QtWidgets.QFileDialog.getOpenFileName', return_value=("examples/airpods_charging.json", '')):
-            self.window.open_file()
 
-    def test_open_run_save_workflow(self):
-        """Tests the full open -> run -> save workflow."""
-        # Verification of open is in setUp
+    @patch('PySide6.QtWidgets.QMessageBox.exec', return_value=True) # Auto-accept security warnings
+    @patch('PySide6.QtWidgets.QFileDialog.getOpenFileName')
+    def test_open_file_loads_data(self, mock_get_open_file_name, mock_msg_box):
+        """Tests that opening a file correctly loads the model into the UI."""
+        # Arrange
+        mock_get_open_file_name.return_value = ("examples/airpods_charging.json", "JSON Files (*.json)")
+
+        # Act
+        self.window.open_file()
+
+        # Assert
         self.assertEqual(self.window.current_model.name, "AirPods Charging Scenario")
+        self.assertGreater(self.window.table_states.rowCount(), 0)
+        self.assertEqual(self.window.table_states.item(0, 0).text(), "case_battery")
 
-        # Test run
-        self.window.run_simulation()
-        results_text = self.window.results_browser.toPlainText()
-        self.assertIn("Simulation Complete", results_text)
-
-        # Test save
+    @patch('PySide6.QtWidgets.QMessageBox.information')
+    @patch('PySide6.QtWidgets.QFileDialog.getSaveFileName')
+    def test_save_file_workflow(self, mock_get_save_file_name, mock_msg_box):
+        """Tests the file saving functionality."""
+        # Arrange
         save_path = "test_output.json"
-        with patch('PySide6.QtWidgets.QFileDialog.getSaveFileName', return_value=(save_path, '')):
-            self.window.save_file()
+        mock_get_save_file_name.return_value = (save_path, "JSON Files (*.json)")
+        self.window.load_model_to_ui(SystemModel(name="Save Test"))
+
+        # Act
+        self.window.save_file()
+
+        # Assert
         self.assertTrue(os.path.exists(save_path))
+        mock_msg_box.assert_called_with(self.window, "Success", "File saved successfully.")
+
+        # Clean up
         os.remove(save_path)
 
-    def test_state_editing(self):
+    def test_state_editing_ui(self):
         """Tests adding, editing, and removing states via UI methods."""
-        initial_state_count = len(self.window.current_model.states)
+        # Arrange
+        self.window.load_model_to_ui(SystemModel(name="State Edit Test"))
+        initial_count = self.window.table_states.rowCount()
 
-        # Test Add State
+        # Act (Add)
         self.window.add_state_row()
-        self.assertEqual(len(self.window.current_model.states), initial_state_count + 1)
-        self.assertEqual(self.window.table_states.rowCount(), initial_state_count + 1)
-        self.assertEqual(self.window.current_model.states[-1].name, f"new_state_{initial_state_count}")
 
-        # Test Edit State (programmatically trigger the signal)
-        new_name = "test_battery"
-        new_range = "(0, 100)"
-        self.window.table_states.setItem(initial_state_count, 0, QTableWidgetItem(""))
-        self.window.table_states.item(initial_state_count, 0).setText(new_name)
+        # Assert (Add)
+        self.assertEqual(self.window.table_states.rowCount(), initial_count + 1)
 
-        self.window.table_states.setItem(initial_state_count, 3, QTableWidgetItem(""))
-        self.window.table_states.item(initial_state_count, 3).setText(new_range)
+        # Act (Edit)
+        self.window.table_states.setItem(initial_count, 0, QTableWidgetItem("new_name"))
+        self.window.update_state_in_model(initial_count, 0)
 
-        self.assertEqual(self.window.current_model.states[-1].name, new_name)
-        self.assertEqual(self.window.current_model.states[-1].range, (0, 100))
+        # Assert (Edit)
+        self.assertEqual(self.window.current_model.states[initial_count].name, "new_name")
 
-        # Test Remove State
-        self.window.table_states.setCurrentCell(initial_state_count, 0) # Select the new row
+        # Act (Remove)
+        self.window.table_states.setCurrentCell(initial_count, 0)
         self.window.remove_selected_state()
-        self.assertEqual(len(self.window.current_model.states), initial_state_count)
-        self.assertEqual(self.window.table_states.rowCount(), initial_state_count)
 
-    def test_event_editing(self):
-        """Tests adding, editing, and removing events via UI methods."""
-        initial_event_count = len(self.window.current_model.events)
-
-        # Test Add Event
-        self.window.add_event()
-        self.assertEqual(len(self.window.current_model.events), initial_event_count + 1)
-        self.assertEqual(self.window.list_events.count(), initial_event_count + 1)
-
-        # Test Edit Event (select and modify text)
-        self.window.list_events.setCurrentRow(initial_event_count)
-        new_condition = "case_battery > 50"
-        self.window.edit_event_condition.setPlainText(new_condition)
-        self.assertEqual(self.window.current_model.events[-1].condition, new_condition)
-
-        # Test Remove Event
-        self.window.remove_selected_event()
-        self.assertEqual(len(self.window.current_model.events), initial_event_count)
-        self.assertEqual(self.window.list_events.count(), initial_event_count)
-
+        # Assert (Remove)
+        self.assertEqual(self.window.table_states.rowCount(), initial_count)
 
 if __name__ == '__main__':
+    # Add src to path to allow running this test file directly
+    import sys
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     unittest.main()

@@ -6,3 +6,4 @@ graphviz
 pydantic
 google-generativeai
 PySide6
+pytest
