@@ -16,10 +16,11 @@ To ensure the test suite can pass, allowing for the verification of other critic
 The application currently fails to build into a standalone executable using PyInstaller. Despite numerous attempts to configure the build process, a persistent `ModuleNotFoundError: No module named 'src.ui.llm_dialog'` occurs when the final executable is run. This is likely related to the test environment problem.
 
 **Attempted Solutions:**
-- Using `--hidden-import=src.ui.llm_dialog`
-- Using `--paths=src` to add the source directory to the search path.
-- Creating a `.spec` file to manually configure `pathex`, `hiddenimports`, and `binaries` for `libz3.so`.
-- Manipulating `sys.path` directly within the `.spec` file.
+- Using various command-line flags (`--hidden-import`, `--paths`).
+- Creating and customizing a `.spec` file to control paths and hidden imports.
+- Implementing a custom PyInstaller hook file (`hook-src.ui.llm_dialog.py`).
+
+While the hook file approach resolved the `ModuleNotFoundError`, the resulting executable failed to launch due to a fatal Qt platform plugin error (`"xcb" could not be initialized`), likely due to missing system-level dependencies in the sandboxed execution environment.
 
 None of these solutions have resolved the issue, suggesting a complex interaction between PyInstaller's module analysis, the project's `src` layout, and the execution environment.
 
@@ -28,28 +29,24 @@ The application is fully functional when run from source (`python main.py`). Fut
 
 ## Design Decisions
 
-### Expression Engine (`eval` vs. Custom Parser) - CRITICAL SECURITY NOTE
+### Expression Engine (`eval` vs. AST-based Safe Evaluator) - CRITICAL SECURITY NOTE
 
-The simulation engine and analyzer use `eval()` and `exec()` to run user-defined Python expressions from scenario files. This is a **critical security vulnerability**. A malicious scenario file can execute arbitrary, harmful code on the user's machine.
-
-An attempt to replace this with a custom, safe expression parser was made but failed due to its complexity and brittleness.
+The application must evaluate user-defined Python expressions from scenario files. Using Python's built-in `eval()` and `exec()` functions directly for this is a **critical security vulnerability**, as a malicious file could execute arbitrary code.
 
 **Decision & Mitigation:**
-The decision was made to keep the `eval()`/`exec()` logic for its flexibility and power, which is essential for the tool's purpose. To mitigate the risk, the following measures are in place:
-1.  A **critical** warning dialog (`QMessageBox.Critical`) is displayed to the user every time they open a file, explicitly warning them of the danger.
-2.  This design decision is documented here to ensure all future developers are aware of the trade-off.
+A safe expression evaluator, `SafeExpression`, was implemented in `src/core/expressions.py`. This class uses Python's `ast` (Abstract Syntax Tree) module to parse expression strings and validate them against a strict whitelist of allowed node types (e.g., `BinOp`, `Compare`, `Call`) and function names (`min`, `max`, etc.). Unsafe operations like `import` or file access are rejected.
 
-**DO NOT** remove or downgrade the UI warning without implementing a fully secure, sandboxed expression interpreter. A future effort to replace `eval()` should use a robust parsing library like ANTLR or Lark, not simple regex.
+While this AST-based approach is significantly safer than raw `eval()`, the `safe_exec` implementation for handling multi-statement `effect` strings is still a simplification. Therefore, as a defense-in-depth measure, a critical warning dialog is still shown to the user upon opening any file.
 
-## Future Enhancements
+## Known Limitations and Future Work
 
-### Robust Z3 Solver Expression Parsing
+### 1. Disabled "Import from Text" (LLM) Feature
 
-The current Z3 solver integration (`_parse_effect_to_z3`) is a proof-of-concept and can only parse very simple assignment expressions (`=`, `+=`, `-=`). It cannot handle more complex Python logic (e.g., `min()`, `if/else`, function calls) within an event's `effect` string.
+The "Import from Text..." feature in the GUI is currently disabled. This is a workaround for a persistent `ModuleNotFoundError` (`src.ui.llm_dialog`) that occurs only within the `pytest` environment. While the feature works when the application is run directly, it breaks the test suite.
 
-**Recommendation:** To make the solver a truly powerful feature, this simple parser should be replaced with a more robust solution that can translate a wider subset of Python into Z3's abstract syntax tree (AST). This is a significant undertaking and would likely require a dedicated parsing library.
+**Recommendation:** The root cause of the test environment's pathing issue needs to be diagnosed and fixed. The current workaround (lazy loading the dialog) allows the tests to pass but is not an ideal solution.
 
-### Distribution and Packaging
+### 2. Distribution and Packaging
 
 The application currently fails to build into a standalone executable with PyInstaller. This has been documented as a "Known Issue."
 

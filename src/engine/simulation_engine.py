@@ -1,15 +1,70 @@
 """
 Core simulation engine for running scenario explorations.
 """
+import ast
 import networkx as nx
 import random
-from z3 import Solver, Bool, Int, Real, And, Or, Not, sat, Implies
+from z3 import Solver, Bool, Int, Real, And, Or, Not, sat, Implies, If
 
 from src.core.models import SystemModel
+from src.core.expressions import safe_eval, safe_exec
+
+# --- AST to Z3 Converter ---
+class PyToZ3Converter(ast.NodeVisitor):
+    """
+    Converts a Python AST expression into a Z3 symbolic expression.
+    """
+    def __init__(self, z3_state_vars):
+        self.state = z3_state_vars
+
+    def visit_BinOp(self, node):
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.Div): return left / right
+        raise NotImplementedError(f"Unsupported binary operator: {type(node.op)}")
+
+    def visit_Compare(self, node):
+        left = self.visit(node.left)
+        right = self.visit(node.comparators[0]) # Assume single comparator
+        op = node.ops[0]
+        if isinstance(op, ast.Eq): return left == right
+        if isinstance(op, ast.NotEq): return left != right
+        if isinstance(op, ast.Lt): return left < right
+        if isinstance(op, ast.LtE): return left <= right
+        if isinstance(op, ast.Gt): return left > right
+        if isinstance(op, ast.GtE): return left >= right
+        raise NotImplementedError(f"Unsupported comparison operator: {type(op)}")
+
+    def visit_IfExp(self, node):
+        test = self.visit(node.test)
+        body = self.visit(node.body)
+        orelse = self.visit(node.orelse)
+        return If(test, body, orelse)
+
+    def visit_Call(self, node):
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Unsupported function call type")
+
+        func_name = node.func.id
+        args = [self.visit(arg) for arg in node.args]
+
+        if func_name == 'min':
+            return If(args[0] < args[1], args[0], args[1])
+        if func_name == 'max':
+            return If(args[0] > args[1], args[0], args[1])
+        raise ValueError(f"Unsupported function: {func_name}")
+
+    def visit_Name(self, node):
+        return self.state[node.id]
+
+    def visit_Constant(self, node):
+        return node.value
 
 def _parse_z3_model_to_path(model, events, z3_event_vars, max_steps, goal_expr, state_vars, z3_state_vars):
     """Helper to reconstruct the event path from a satisfied Z3 model."""
-    # Find the first step k where the goal is violated
     for k_check in range(1, max_steps + 1):
         # Build a dictionary of the state variables at step k_check from the model
         state_k_dict_model = {}
@@ -43,45 +98,47 @@ def _parse_z3_model_to_path(model, events, z3_event_vars, max_steps, goal_expr, 
 
     return "Violation found but failed to reconstruct path."
 
-def _parse_effect_to_z3(effect_str, state_k, state_k_plus_1):
+def _parse_effect_to_z3(effect_str: str, state_k: dict, state_k_plus_1: dict):
     """
-    A simple parser to convert an effect string into Z3 constraints.
-    WARNING: This is a simplified implementation and only handles basic cases.
+    Parses an effect string (e.g., "x = x + 1; y = min(100, x)") into
+    a Z3 constraint using the PyToZ3Converter.
     """
     assignments = []
     modified_vars = set()
+    converter = PyToZ3Converter(state_k)
 
-    clauses = [c.strip() for c in effect_str.split(';') if c.strip()]
+    # Parse the entire effect string as a module
+    try:
+        effect_tree = ast.parse(effect_str.strip(), mode='exec')
+    except SyntaxError:
+        return And(True) # Ignore invalid syntax
 
-    for clause in clauses:
-        if '+=' in clause:
-            var, val_str = [p.strip() for p in clause.split('+=')]
-            assignments.append(state_k_plus_1[var] == state_k[var] + int(val_str))
-            modified_vars.add(var)
-        elif '-=' in clause:
-            var, val_str = [p.strip() for p in clause.split('-=')]
-            assignments.append(state_k_plus_1[var] == state_k[var] - int(val_str))
-            modified_vars.add(var)
-        elif '=' in clause:
-            var, expr_str = [p.strip() for p in clause.split('=', 1)]
-            if 'not' in expr_str:
-                rhs_var = expr_str.replace('not', '').strip()
-                assignments.append(state_k_plus_1[var] == Not(state_k[rhs_var]))
+    for stmt in effect_tree.body:
+        # Handle simple assignments: var = expr
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            var_name = stmt.targets[0].id
+            z3_expr = converter.visit(stmt.value)
+            assignments.append(state_k_plus_1[var_name] == z3_expr)
+            modified_vars.add(var_name)
+        # Handle augmented assignments: var += expr
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            var_name = stmt.target.id
+            z3_expr = converter.visit(stmt.value)
+            op = stmt.op
+            if isinstance(op, ast.Add):
+                assignments.append(state_k_plus_1[var_name] == state_k[var_name] + z3_expr)
+            elif isinstance(op, ast.Sub):
+                assignments.append(state_k_plus_1[var_name] == state_k[var_name] - z3_expr)
             else:
-                try: assignments.append(state_k_plus_1[var] == int(expr_str))
-                except ValueError:
-                    try: assignments.append(state_k_plus_1[var] == (expr_str.lower() == 'true'))
-                    except:
-                        if expr_str in state_k: # Assignment from another variable
-                             assignments.append(state_k_plus_1[var] == state_k[expr_str])
-            modified_vars.add(var)
+                raise NotImplementedError(f"Unsupported augmented assignment op: {type(op)}")
+            modified_vars.add(var_name)
 
     # Frame axiom: variables not modified by the effect remain unchanged
     for var_name in state_k:
         if var_name not in modified_vars:
             assignments.append(state_k_plus_1[var_name] == state_k[var_name])
 
-    return And(assignments)
+    return And(assignments) if assignments else And(True)
 
 
 class SimulationEngine:
@@ -94,11 +151,10 @@ class SimulationEngine:
         applicable = {}
         for event in self.model.events:
             try:
-                # Use a restricted globals dict for safety
-                if eval(event.condition, {"__builtins__": {}}, state_dict):
+                if safe_eval(event.condition, state_dict):
                     applicable[event.name] = event
             except Exception:
-                continue # Event condition fails or is invalid
+                continue # Event condition fails, is invalid, or unsafe
         return applicable
 
     def apply_event(self, state_dict, event_name):
@@ -108,10 +164,7 @@ class SimulationEngine:
 
         new_state = state_dict.copy()
         try:
-            # Use a restricted globals dict for safety
-            exec(event.effect, {"__builtins__": {}}, new_state)
-            # Remove special exec variables from the state
-            if '__builtins__' in new_state: del new_state['__builtins__']
+            safe_exec(event.effect, new_state)
         except Exception:
             return state_dict # Revert state if effect fails
         return new_state
