@@ -3,7 +3,7 @@ Main window for the Scenario Simulator GUI.
 """
 import sys
 import json
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, QObject, Signal
 from PySide6.QtGui import QPixmap, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -15,12 +15,50 @@ from src.core.models import SystemModel, StateVariable, Event, Constraint, Goal
 from src.engine.simulation_engine import SimulationEngine
 from src.engine.analyzer import Analyzer
 from src.parsers.json_parser import JSONParser
-# from src.ui.llm_dialog import LlmImportDialog # Temporarily disabled
+# LlmImportDialog is imported lazily in show_llm_import_dialog to avoid test issues
 from src.ui.visualizer import generate_graph_visualization
+
+class SimulationWorker(QObject):
+    """
+    Worker thread for running simulations without freezing the GUI.
+    """
+    finished = Signal(object)
+    error = Signal(Exception)
+
+    def __init__(self, model, mode, params):
+        super().__init__()
+        self.model = model
+        self.mode = mode
+        self.params = params
+
+    def run(self):
+        try:
+            engine = SimulationEngine(self.model)
+            if self.mode == "BFS":
+                state_graph = engine.run_bfs_explorer()
+            elif self.mode == "Monte Carlo":
+                state_graph = engine.run_monte_carlo_explorer(self.params.get("mc_steps"))
+            elif self.mode == "Solver":
+                result = engine.run_solver_explorer(self.params.get("goal_expr"), self.params.get("max_steps"))
+                self.finished.emit(result)
+                return
+
+            analyzer = Analyzer(self.model, state_graph)
+            results = {
+                "graph": state_graph,
+                "constraint_v": analyzer.find_constraint_violations(),
+                "goal_v": analyzer.find_goal_violations(),
+                "deadlocks": analyzer.find_deadlocks(),
+            }
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(e)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.simulation_thread = None
+        self.simulation_worker = None
         self.setWindowTitle("Scenario Editor & Simulator")
         self.setGeometry(100, 100, 1200, 800)
         self.current_model = SystemModel(name="New Scenario")
@@ -87,8 +125,10 @@ class MainWindow(QMainWindow):
         save_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         save_action.triggered.connect(self.save_file)
 
-        # import_text_action = file_menu.addAction("Import from Text...") # Temporarily disabled
-        # import_text_action.triggered.connect(self.show_llm_import_dialog)
+        file_menu.addSeparator()
+
+        import_text_action = file_menu.addAction("Import from Text...")
+        import_text_action.triggered.connect(self.show_llm_import_dialog)
 
     def new_file(self):
         self.load_model_to_ui(SystemModel(name="New Scenario"))
@@ -329,51 +369,106 @@ class MainWindow(QMainWindow):
         self.list_goals.currentItemChanged.connect(self.display_selected_cg)
 
     def run_simulation(self):
-        self.results_browser.clear(); self.graph_display_label.clear()
-        self.statusBar().showMessage("Running simulation...")
-        QApplication.processEvents()
-
-        model = self.current_model
-        if not model.states:
+        if not self.current_model.states:
             QMessageBox.critical(self, "Error", "Cannot run simulation without any states defined.")
-            self.statusBar().showMessage("Simulation failed: No states defined.")
             return
 
-        engine = SimulationEngine(model)
+        self.btn_run_simulation.setEnabled(False)
+        self.btn_run_solver.setEnabled(False)
+        self.statusBar().showMessage("Running simulation...")
+
         mode = self.combo_sim_mode.currentText()
-        try:
-            if mode == "BFS": state_graph = engine.run_bfs_explorer()
-            else: state_graph = engine.run_monte_carlo_explorer(self.spin_mc_steps.value())
+        params = {"mc_steps": self.spin_mc_steps.value()}
 
-            analyzer = Analyzer(model, state_graph)
-            constraint_v = analyzer.find_constraint_violations()
-            goal_v = analyzer.find_goal_violations()
-            deadlocks = analyzer.find_deadlocks()
+        self.simulation_thread = QThread()
+        self.simulation_worker = SimulationWorker(self.current_model, mode, params)
+        self.simulation_worker.moveToThread(self.simulation_thread)
 
-            report = [f"<b>--- Simulation Complete ---</b>", f"Mode: {mode}", f"Found {state_graph.number_of_nodes()} states and {state_graph.number_of_edges()} transitions."]
-        except Exception as e:
-            QMessageBox.critical(self, "Simulation Error", f"An unexpected error occurred during simulation:\n{e}")
-            self.statusBar().showMessage("Simulation failed.")
+        self.simulation_thread.started.connect(self.simulation_worker.run)
+        self.simulation_worker.finished.connect(self.handle_simulation_results)
+        self.simulation_worker.error.connect(self.handle_simulation_error)
+
+        self.simulation_thread.start()
+
+    def run_solver_simulation(self):
+        if self.active_list_widget != self.list_goals or self.list_goals.currentRow() < 0:
+            QMessageBox.warning(self, "Warning", "Please select a goal to check for violations.")
             return
-        if not any([constraint_v, goal_v, deadlocks]): report.append("<br><b><font color='green'>✅ No issues found!</font></b>")
+
+        self.btn_run_simulation.setEnabled(False)
+        self.btn_run_solver.setEnabled(False)
+        self.statusBar().showMessage("Running Z3 Solver...")
+
+        goal = self.current_model.goals[self.list_goals.currentRow()]
+        params = {"goal_expr": goal.expression, "max_steps": self.spin_solver_steps.value()}
+
+        self.simulation_thread = QThread()
+        self.simulation_worker = SimulationWorker(self.current_model, "Solver", params)
+        self.simulation_worker.moveToThread(self.simulation_thread)
+
+        self.simulation_thread.started.connect(self.simulation_worker.run)
+        self.simulation_worker.finished.connect(self.handle_solver_results)
+        self.simulation_worker.error.connect(self.handle_simulation_error)
+
+        self.simulation_thread.start()
+
+    def handle_simulation_results(self, results):
+        self.btn_run_simulation.setEnabled(True)
+        self.btn_run_solver.setEnabled(True)
+        self.simulation_thread.quit()
+        self.simulation_thread.wait()
+
+        state_graph = results["graph"]
+        mode = self.combo_sim_mode.currentText()
+        report = [f"<b>--- Simulation Complete ---</b>", f"Mode: {mode}", f"Found {state_graph.number_of_nodes()} states and {state_graph.number_of_edges()} transitions."]
+
+        if not any([results["constraint_v"], results["goal_v"], results["deadlocks"]]):
+            report.append("<br><b><font color='green'>✅ No issues found!</font></b>")
         else:
-            if constraint_v:
+            if results["constraint_v"]:
                 report.append("<br><b><font color='red'>Constraint Violations:</font></b>")
-                for v in constraint_v: report.append(f"- <b>{v['constraint']}</b> violated...<br>  Path: {' -> '.join(v['path'])}")
-            if goal_v:
+                for v in results["constraint_v"]: report.append(f"- <b>{v['constraint']}</b> violated...<br>  Path: {' -> '.join(v['path'])}")
+            if results["goal_v"]:
                 report.append("<br><b><font color='orange'>Goal Violations:</font></b>")
-                for v in goal_v: report.append(f"- <b>{v['goal']}</b> violated...<br>  Path: {' -> '.join(v['path'])}")
-            if deadlocks:
+                for v in results["goal_v"]: report.append(f"- <b>{v['goal']}</b> violated...<br>  Path: {' -> '.join(v['path'])}")
+            if results["deadlocks"]:
                 report.append("<br><b><font color='blue'>Deadlocks Found:</font></b>")
-                for d in deadlocks: report.append(f"- Deadlock at state: {d['state']}")
+                for d in results["deadlocks"]: report.append(f"- Deadlock at state: {d['state']}")
         self.results_browser.setHtml("<br>".join(report))
 
-        self.statusBar().showMessage("Simulation complete. Generating graph visualization...")
+        self.visualize_graph(state_graph)
+
+    def handle_solver_results(self, result):
+        self.btn_run_simulation.setEnabled(True)
+        self.btn_run_solver.setEnabled(True)
+        self.simulation_thread.quit()
+        self.simulation_thread.wait()
+
+        if isinstance(result, list):
+            path_str = " -> ".join(result)
+            display_text = f"<b>--- Solver Result ---</b><br>Found a violation path:<br>{path_str}"
+            self.statusBar().showMessage("Solver found a violation path.")
+        else:
+            display_text = f"<b>--- Solver Result ---</b><br>{result}"
+            self.statusBar().showMessage("Solver finished: No violation found.")
+        self.results_browser.setHtml(display_text)
+
+    def handle_simulation_error(self, e):
+        self.btn_run_simulation.setEnabled(True)
+        self.btn_run_solver.setEnabled(True)
+        self.statusBar().showMessage("Simulation failed.")
+        QMessageBox.critical(self, "Simulation Error", f"An unexpected error occurred:\n{e}")
+        self.simulation_thread.quit()
+        self.simulation_thread.wait()
+
+    def visualize_graph(self, state_graph):
+        self.statusBar().showMessage("Generating graph visualization...")
         QApplication.processEvents()
 
         import tempfile, os
         try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp: temp_graph_path = tmp.name
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                temp_graph_path = tmp.name
             generate_graph_visualization(state_graph, temp_graph_path)
             pixmap = QPixmap(temp_graph_path)
             self.graph_display_label.setPixmap(pixmap.scaled(self.graph_display_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -383,40 +478,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Graph visualization failed.")
             QMessageBox.warning(self, "Graphviz Error", f"Could not generate graph visualization. Is Graphviz installed and in your PATH?\nError: {e}")
 
-    def run_solver_simulation(self):
-        if self.active_list_widget != self.list_goals or self.list_goals.currentRow() < 0:
-            QMessageBox.warning(self, "Warning", "Please select a goal to check for violations.")
-            return
-
-        goal = self.current_model.goals[self.list_goals.currentRow()]
-        max_steps = self.spin_solver_steps.value()
-
-        self.statusBar().showMessage(f"Running Z3 Solver for goal: '{goal.description}'...")
-        QApplication.processEvents()
-
-        engine = SimulationEngine(self.current_model)
-
-        try:
-            result = engine.run_solver_explorer(goal.expression, max_steps)
-
-            if isinstance(result, list):
-                path_str = " -> ".join(result)
-                display_text = f"<b>--- Solver Result ---</b><br>Found a violation path:<br>{path_str}"
-                self.statusBar().showMessage("Solver found a violation path.")
-            else:
-                display_text = f"<b>--- Solver Result ---</b><br>{result}"
-                self.statusBar().showMessage("Solver finished: No violation found.")
-
-            self.results_browser.setHtml(display_text)
-        except Exception as e:
-            QMessageBox.critical(self, "Solver Error", f"An unexpected error occurred during solver execution:\n{e}")
-            self.statusBar().showMessage("Solver failed.")
-
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Scenario", "", "JSON Files (*.json)")
         if file_path:
-            msg_box = QMessageBox(self); msg_box.setIcon(QMessageBox.Warning); msg_box.setText("Security Warning")
-            msg_box.setInformativeText("Loading a scenario file will execute Python code embedded within it.\n\nOnly open files from sources you trust.")
+            msg_box = QMessageBox(self); msg_box.setIcon(QMessageBox.Critical); msg_box.setText("Critical Security Warning")
+            msg_box.setInformativeText(
+                "You are about to open a scenario file that contains executable Python code ('eval/exec').\n\n"
+                "<b>NEVER open files from untrusted sources.</b> A malicious file could execute harmful code on your computer.\n\n"
+                "Do you still want to proceed?"
+            )
             msg_box.setStandardButtons(QMessageBox.Open | QMessageBox.Cancel); msg_box.setDefaultButton(QMessageBox.Cancel)
             if msg_box.exec() == QMessageBox.Cancel:
                 self.statusBar().showMessage("Open operation cancelled.")
@@ -441,9 +511,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"An error occurred while saving the file:\n{e}")
                 self.statusBar().showMessage("Failed to save file.")
 
-    # def show_llm_import_dialog(self):
-    #     from src.ui.llm_dialog import LlmImportDialog
-    #     dialog = LlmImportDialog(self); dialog.model_parsed.connect(self.load_model_to_ui); dialog.exec()
+    def show_llm_import_dialog(self):
+        """Lazily imports and shows the LlmImportDialog."""
+        try:
+            from src.ui.llm_dialog import LlmImportDialog
+            dialog = LlmImportDialog(self)
+            dialog.model_parsed.connect(self.load_model_to_ui)
+            dialog.exec()
+        except ImportError:
+            QMessageBox.critical(self, "Error", "Could not load the LLM import dialog. This feature may be unavailable in this environment.")
 
 def start_gui():
     app = QApplication(sys.argv)
