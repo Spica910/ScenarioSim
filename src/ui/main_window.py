@@ -15,7 +15,9 @@ from src.core.models import SystemModel, StateVariable, Event, Constraint, Goal
 from src.engine.simulation_engine import SimulationEngine
 from src.engine.analyzer import Analyzer
 from src.parsers.json_parser import JSONParser
-# LlmImportDialog is imported lazily in show_llm_import_dialog to avoid test issues
+from src.parsers.llm_parser import parse_scenario_from_text
+from src.ui.settings_dialog import SettingsDialog, get_api_key
+from src.ui.llm_import_dialog import LlmImportDialog
 from src.ui.visualizer import generate_graph_visualization
 
 class SimulationWorker(QObject):
@@ -128,7 +130,23 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
 
         import_text_action = file_menu.addAction("Import from Text...")
+        import_text_action.setToolTip("Use a configured LLM to parse a natural language description into a scenario.")
         import_text_action.triggered.connect(self.show_llm_import_dialog)
+
+        file_menu.addSeparator()
+
+        exit_action = file_menu.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+
+        # --- Settings Menu ---
+        settings_menu = menu_bar.addMenu("&Settings")
+        configure_api_action = settings_menu.addAction("Configure API Key...")
+        configure_api_action.triggered.connect(self.show_settings_dialog)
+
+    def show_settings_dialog(self):
+        """Shows the API key settings dialog."""
+        dialog = SettingsDialog(self)
+        dialog.exec()
 
     def new_file(self):
         self.load_model_to_ui(SystemModel(name="New Scenario"))
@@ -512,14 +530,44 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Failed to save file.")
 
     def show_llm_import_dialog(self):
-        """Lazily imports and shows the LlmImportDialog."""
-        try:
-            from src.ui.llm_dialog import LlmImportDialog
-            dialog = LlmImportDialog(self)
-            dialog.model_parsed.connect(self.load_model_to_ui)
-            dialog.exec()
-        except ImportError:
-            QMessageBox.critical(self, "Error", "Could not load the LLM import dialog. This feature may be unavailable in this environment.")
+        """Handles the entire LLM import workflow."""
+        api_key = get_api_key()
+        if not api_key:
+            QMessageBox.warning(self, "API Key Required",
+                                "Please configure your Google Gemini API key in the 'Settings' menu before using this feature.")
+            return
+
+        dialog = LlmImportDialog(self)
+        if dialog.exec():
+            self.statusBar().showMessage("Parsing scenario with LLM... (this may take a moment)")
+            QApplication.processEvents() # Ensure the UI updates
+
+            text = dialog.get_text()
+            if not text.strip():
+                self.statusBar().showMessage("Import cancelled: No text provided.")
+                return
+
+            # Run parsing in a separate thread to keep the GUI responsive
+            # (Although for gemini-flash it should be fast)
+            parsed_json_str = parse_scenario_from_text(api_key, text)
+
+            try:
+                data = json.loads(parsed_json_str)
+                if "error" in data:
+                    QMessageBox.critical(self, "LLM Parsing Error", f"An error occurred:\n{data['error']}")
+                    self.statusBar().showMessage("LLM parsing failed.")
+                    return
+
+                model = JSONParser().parse(parsed_json_str)
+                self.load_model_to_ui(model)
+                self.statusBar().showMessage("Scenario successfully imported from text.")
+
+            except json.JSONDecodeError:
+                QMessageBox.critical(self, "LLM Parsing Error", "The LLM returned invalid JSON. Please try again or refine your description.")
+                self.statusBar().showMessage("LLM parsing failed: Invalid JSON returned.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"An error occurred after parsing:\n{e}")
+                self.statusBar().showMessage("Failed to load parsed scenario.")
 
 def start_gui():
     app = QApplication(sys.argv)

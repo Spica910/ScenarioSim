@@ -117,3 +117,4 @@ dmypy.json
 build/
 dist/
 *.spec
+config.json
