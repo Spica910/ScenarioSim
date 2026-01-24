@@ -1,0 +1,77 @@
+{
+  "name": "AirPods Charging Scenario",
+  "states": [
+    {
+      "name": "case_battery",
+      "type": "int",
+      "initial_value": 20,
+      "range": [0, 100]
+    },
+    {
+      "name": "left_bud_battery",
+      "type": "int",
+      "initial_value": 100,
+      "range": [0, 100]
+    },
+    {
+      "name": "right_bud_battery",
+      "type": "int",
+      "initial_value": 100,
+      "range": [0, 100]
+    },
+    {
+      "name": "buds_in_case",
+      "type": "bool",
+      "initial_value": true
+    },
+    {
+      "name": "cable_connected",
+      "type": "bool",
+      "initial_value": false
+    }
+  ],
+  "events": [
+    {
+      "name": "connect_cable",
+      "condition": "not cable_connected",
+      "effect": "cable_connected = True"
+    },
+    {
+      "name": "disconnect_cable",
+      "condition": "cable_connected",
+      "effect": "cable_connected = False"
+    },
+    {
+      "name": "take_buds_out",
+      "condition": "buds_in_case",
+      "effect": "buds_in_case = False"
+    },
+    {
+      "name": "put_buds_in",
+      "condition": "not buds_in_case",
+      "effect": "buds_in_case = True"
+    },
+    {
+      "name": "time_tick_charging",
+      "condition": "cable_connected and case_battery < 100",
+      "effect": "case_battery = min(100, case_battery + 10)"
+    },
+    {
+        "name": "time_tick_buds_charging_from_case",
+        "condition": "buds_in_case and case_battery > 0 and (left_bud_battery < 100 or right_bud_battery < 100)",
+        "effect": "case_battery -= 10; left_bud_battery = min(100, left_bud_battery + 5); right_bud_battery = min(100, right_bud_battery + 5)"
+    }
+  ],
+  "constraints": [
+    {
+      "description": "Case battery cannot be negative",
+      "expression": "case_battery >= 0"
+    }
+  ],
+  "goals": [
+    {
+      "description": "Case battery should not exceed 100",
+      "expression": "case_battery <= 100"
+    }
+  ]
+}

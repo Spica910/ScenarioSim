@@ -1,0 +1,9 @@
+networkx
+z3-solver
+numpy
+matplotlib
+graphviz
+pydantic
+google-generativeai
+PySide6
+pytest
