@@ -1,102 +1,142 @@
 """
-Parser that uses a Large Language Model (LLM) to convert natural language
-into a structured SystemModel.
+Parses a natural language scenario description into a structured JSON model
+using the Google Gemini LLM.
 """
-import os
 import google.generativeai as genai
-from src.core.models import SystemModel
-from src.parsers.base_parser import BaseParser
-from src.parsers.json_parser import JSONParser
+import json
 
-# It's recommended to set the API key in your environment variables
-# For example: export GOOGLE_API_KEY="your_api_key"
-genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-
-class LLMParser(BaseParser):
+def parse_scenario_from_text(api_key: str, text: str) -> str:
     """
-    Parses a natural language description of a scenario into a SystemModel
-    by querying the Gemini LLM.
+    Uses the Gemini 1.5 Flash model to parse natural language text into the
+    scenario JSON format.
+
+    Args:
+        api_key: The Google API key for authentication.
+        text: The natural language text describing the scenario.
+
+    Returns:
+        A string containing the structured scenario in JSON format, or an
+        error message string if parsing fails.
     """
-    def __init__(self, model_name="gemini-1.5-flash"):
-        self.model = genai.GenerativeModel(model_name)
-        self.json_parser = JSONParser()
+    if not api_key:
+        return '{"error": "API key is not set. Please configure it in Settings."}'
 
-    def parse(self, natural_language_input: str) -> SystemModel:
-        """
-        Converts natural language input to a SystemModel using an LLM.
+    genai.configure(api_key=api_key)
 
-        Args:
-            natural_language_input: The user's description of the scenario.
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
-        Returns:
-            A SystemModel object.
-        """
-        prompt = self._build_prompt(natural_language_input)
+    prompt = f"""
+    You are an expert system designer specializing in converting natural language
+    descriptions of state machines into a precise JSON format. Your task is to
+    parse the user's text and convert it into a valid JSON object that strictly
+    follows the provided schema.
 
-        try:
-            # Call the Gemini API
-            response = self.model.generate_content(prompt)
+    **JSON Schema:**
+    {{
+      "name": "Scenario Name",
+      "states": [
+        {{"name": "variable_name", "type": "int|float|bool", "initial_value": value}}
+      ],
+      "events": [
+        {{"name": "event_name", "condition": "Python expression", "effect": "Python expression"}}
+      ],
+      "constraints": [
+        {{"description": "A rule that must never be violated", "expression": "Python boolean expression"}}
+      ],
+      "goals": [
+        {{"description": "A condition to verify", "expression": "Python boolean expression"}}
+      ]
+    }}
 
-            # The model should return a JSON string, which we can then parse.
-            # Basic cleanup to remove markdown code fences if they exist.
-            json_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+    **Instructions:**
+    1.  **Strictly adhere to the JSON schema.** Do not add any extra fields.
+    2.  **`type`** must be one of: `int`, `float`, or `bool`.
+    3.  **`initial_value`** must match the specified `type`.
+    4.  **`condition`** and **`effect`** in events must be valid Python expressions.
+        - `effect` should be an assignment (e.g., `var = val` or `var += 1`).
+        - `condition` should evaluate to a boolean (e.g., `var > 0`). Use `True` if an event can always happen.
+    5.  **`expression`** in constraints and goals must be a valid Python boolean expression.
+    6.  Enclose all JSON keys and string values in double quotes.
+    7.  If the user's text is ambiguous or incomplete, make reasonable assumptions based on typical state machine logic.
+    8.  Your entire output must be **only the JSON object**, with no surrounding text, markdown, or explanations.
 
-            # Use the existing JSONParser to validate and create the SystemModel
-            return self.json_parser.parse(json_response)
+    **User's Scenario Description:**
+    ---
+    {text}
+    ---
 
-        except Exception as e:
-            print(f"Error calling Gemini API or parsing its response: {e}")
-            # Return an empty model as a fallback
-            return SystemModel(name="Failed LLM Parsing")
+    **Your JSON Output:**
+    """
 
-    def _build_prompt(self, scenario_text: str) -> str:
-        """
-        Creates the full prompt to send to the LLM.
-        """
-        # This prompt is crucial. It guides the LLM to produce the correct JSON format.
-        prompt = f"""
-You are an expert system designer. Your task is to convert a natural language
-description of a device's behavior into a structured JSON model. The JSON
-should conform to the schema defined by these Pydantic models:
+    try:
+        response = model.generate_content(prompt)
 
-```python
-class StateVariable(BaseModel):
-    name: str
-    type: str  # 'int', 'bool', 'float', 'enum'
-    initial_value: Any
-    range: Tuple[float, float] = None
-    enum_values: List[str] = None
+        # Clean up the response to get only the JSON part
+        raw_json = response.text.strip()
+        if raw_json.startswith("```json"):
+            raw_json = raw_json[7:]
+        if raw_json.endswith("```"):
+            raw_json = raw_json[:-3]
 
-class Event(BaseModel):
-    name: str
-    condition: str = "True"
-    effect: str
+        # Validate that the result is valid JSON
+        json.loads(raw_json)
 
-class Constraint(BaseModel):
-    description: str
-    expression: str
+        return raw_json
 
-class Goal(BaseModel):
-    description: str
-    expression: str
+    except Exception as e:
+        return f'{{"error": "Failed to parse scenario with LLM: {str(e)}"}}'
 
-class SystemModel(BaseModel):
-    name: str
-    states: List[StateVariable]
-    events: List[Event]
-    constraints: List[Constraint]
-    goals: List[Goal]
-```
+if __name__ == '__main__':
+    # Example usage for testing
+    # Make sure to set your GOOGLE_API_KEY as an environment variable
+    import os
+    test_api_key = os.environ.get("GOOGLE_API_KEY")
 
-Based on the schema above, convert the following scenario description into a
-single JSON object of type SystemModel. Ensure all expressions in 'condition',
-'effect', 'expression' are valid Python code.
+    test_scenario = """
+    Name: AirPods Charging Test
 
-Scenario Description:
----
-{scenario_text}
----
+    States:
+    - case_battery: an integer, starts at 50
+    - buds_in_case: a boolean, initially true
+    - cable_connected: boolean, starts false
 
-JSON Output:
-"""
-        return prompt
+    Events:
+    - connect_cable: can always happen, sets cable_connected to true.
+    - disconnect_cable: always possible, sets cable_connected to false.
+    - charge_tick: if cable is connected, case battery increases by 10 but not over 100.
+
+    Goals:
+    - The case battery should never exceed 100.
+
+    Constraints:
+    - The case battery must never be negative.
+    """
+
+    if test_api_key:
+        parsed_json = parse_scenario_from_text(test_api_key, test_scenario)
+        print(parsed_json)
+    else:
+        print("Please set the GOOGLE_API_KEY environment variable to run the test.")
+
+    """
+    Expected output structure:
+    {
+      "name": "AirPods Charging Test",
+      "states": [
+        {"name": "case_battery", "type": "int", "initial_value": 50},
+        {"name": "buds_in_case", "type": "bool", "initial_value": true},
+        {"name": "cable_connected", "type": "bool", "initial_value": false}
+      ],
+      "events": [
+        {"name": "connect_cable", "condition": "True", "effect": "cable_connected = True"},
+        {"name": "disconnect_cable", "condition": "True", "effect": "cable_connected = False"},
+        {"name": "charge_tick", "condition": "cable_connected", "effect": "case_battery = min(100, case_battery + 10)"}
+      ],
+      "constraints": [
+        {"description": "The case battery must never be negative.", "expression": "case_battery >= 0"}
+      ],
+      "goals": [
+        {"description": "The case battery should never exceed 100.", "expression": "case_battery <= 100"}
+      ]
+    }
+    """

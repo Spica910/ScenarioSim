@@ -84,77 +84,35 @@ class SimulationEngine:
 
         return graph
 
-    def _parse_and_add_constraint(self, solver, expression, state_vars_t, state_vars_t_plus_1=None):
-        """Improved parser to convert a Python expression string to Z3 constraints."""
-        try:
-            # Create a mapping from variable string names to their Z3 variable counterparts
-            z3_var_map = {v.name: state_vars_t.get(v.name) for v in self.model.states if v.name in state_vars_t}
-
-            # Helper to evaluate expressions within the Z3 context
-            def eval_z3(expr_str):
-                return eval(expr_str, {"__builtins__": {}}, z3_var_map)
-
-            # Handle conditional assignment: "x = val1 if cond else val2"
-            if ' if ' in expression and ' else ' in expression and '=' in expression:
-                assignment_part, condition_part = expression.split(' if ', 1)
-                var_name, true_val_str = [p.strip() for p in assignment_part.split('=', 1)]
-                cond_str, false_val_str = [p.strip() for p in condition_part.split(' else ', 1)]
-
-                cond_z3 = eval_z3(cond_str)
-                true_val_z3 = eval_z3(true_val_str)
-                false_val_z3 = eval_z3(false_val_str)
-
-                solver.add(state_vars_t_plus_1[var_name] == If(cond_z3, true_val_z3, false_val_z3))
-
-            # Handle incremental assignment: "x += 1"
-            elif '+=' in expression:
-                var_name, expr_str = [p.strip() for p in expression.split('+=', 1)]
-                rhs_val = eval_z3(expr_str)
-                solver.add(state_vars_t_plus_1[var_name] == state_vars_t[var_name] + rhs_val)
-
-            # Handle simple assignment: "x = y" or "x = min(100, y + 10)"
-            elif '=' in expression:
-                var_name, expr_str = [p.strip() for p in expression.split('=', 1)]
-
-                # Special handling for min() which doesn't work with Z3 vars in Python's eval
-                min_match = re.match(r'min\((.+),\s*(.+)\)', expr_str)
-                if min_match:
-                    arg1_str, arg2_str = min_match.groups()
-                    arg1_z3 = eval_z3(arg1_str)
-                    arg2_z3 = eval_z3(arg2_str)
-                    rhs_z3 = If(arg1_z3 < arg2_z3, arg1_z3, arg2_z3)
-                    solver.add(state_vars_t_plus_1[var_name] == rhs_z3)
-                else: # Standard assignment
-                    rhs_z3 = eval_z3(expr_str)
-                    solver.add(state_vars_t_plus_1[var_name] == rhs_z3)
-
-            # Handle boolean conditions (for constraints/goals, not event effects)
-            else:
-                 solver.add(eval_z3(expression))
-
-        except Exception as e:
-            print(f"Warning: Could not add constraint for expression '{expression}': {e}")
-            pass
-
     def run_solver_explorer(self, goal_expression, max_steps):
-        """Uses the Z3 SMT solver to find a path to a goal violation (Bounded Model Checking)."""
+        """
+        Uses the Z3 SMT solver to find a path to a goal violation using Bounded Model Checking.
+        This version has been refactored for correctness.
+        """
         solver = Solver()
 
-        states_t = [{
-            var.name: (Bool(f"{var.name}_{t}") if var.type == 'bool' else
-                       Int(f"{var.name}_{t}") if var.type == 'int' else
-                       Real(f"{var.name}_{t}"))
-            for var in self.model.states
-        } for t in range(max_steps + 1)]
+        # --- Variable Definitions ---
+        states_t = []
+        for t in range(max_steps + 1):
+            step_vars = {}
+            for var in self.model.states:
+                if var.type == 'int':
+                    step_vars[var.name] = Int(f"{var.name}_{t}")
+                elif var.type == 'bool':
+                    step_vars[var.name] = Bool(f"{var.name}_{t}")
+                # Extend with float (Real) and other types as necessary
+            states_t.append(step_vars)
 
-        event_choices_t = [{
-            event.name: Bool(f"{event.name}_{t}")
-            for event in self.model.events
-        } for t in range(max_steps)]
+        event_choices_t = [
+            {event.name: Bool(f"{event.name}_{t}") for event in self.model.events}
+            for t in range(max_steps)
+        ]
 
+        # --- Initial State Constraint ---
         for var in self.model.states:
             solver.add(states_t[0][var.name] == var.initial_value)
 
+        # --- Transition and Frame Axiom Constraints ---
         for t in range(max_steps):
             current_vars = states_t[t]
             next_vars = states_t[t+1]
@@ -165,136 +123,71 @@ class SimulationEngine:
                 event_var = events_this_step[event.name]
                 possible_events_this_step.append(event_var)
 
-                z3_var_map = {v.name: current_vars.get(v.name) for v in self.model.states}
-
+                # 1. An event can only be chosen if its condition is true
                 try:
-                    condition_holds = eval(event.condition, {"__builtins__": {}}, z3_var_map)
+                    condition_holds = eval(event.condition, {"__builtins__": {}}, current_vars)
                     solver.add(Implies(event_var, condition_holds))
-                except Exception as e:
-                    print(f"Warning: Could not create solver constraint for event '{event.name}' condition: {e}")
+                except Exception:
                     solver.add(Not(event_var))
 
-            # At least one event must be chosen (this is a simplification, should be "if any is possible")
+                # 2. If an event is chosen, its effect is applied (and non-affected vars are unchanged)
+                try:
+                    touched_vars = re.findall(r"(\w+)\s*(\+)?=", event.effect)
+                    touched_vars = [match[0] for match in touched_vars] # Extract the variable name
+
+                    for var in self.model.states:
+                        var_name = var.name
+                        if var.name in touched_vars:
+                            # If this event modifies the variable, calculate the next state's value
+                            # This uses a trick where we pass Z3's If to eval to handle conditionals
+                            eval_context = {**current_vars, "If": If, "min": lambda a, b: If(a < b, a, b), "max": lambda a, b: If(a > b, a, b)}
+
+                            next_val_expr_str = event.effect.split('=', 1)[1].strip()
+
+                            # Handle incremental assignment `x += 1` by converting to `x = x + 1`
+                            if '+=' in event.effect:
+                                var_in_effect, rhs = [p.strip() for p in event.effect.split('+=', 1)]
+                                if var_in_effect == var_name:
+                                    next_val_expr_str = f"{var_name} + {rhs}"
+
+                            # Rewrite Python ternary `A if C else B` to Z3 `If(C, A, B)`
+                            ternary_match = re.match(r"(.+)\s+if\s+(.+)\s+else\s+(.+)", next_val_expr_str)
+                            if ternary_match:
+                                true_val, cond, false_val = ternary_match.groups()
+                                z3_expr_str = f"If({cond}, {true_val}, {false_val})"
+                                next_val = eval(z3_expr_str, {}, eval_context)
+                            else: # Handle direct assignment and functions like min/max
+                                next_val = eval(next_val_expr_str, {}, eval_context)
+
+                            solver.add(Implies(event_var, next_vars[var_name] == next_val))
+                        else:
+                            # FRAME AXIOM: If this event is chosen, this variable is unchanged
+                            solver.add(Implies(event_var, next_vars[var_name] == current_vars[var_name]))
+                except Exception as e:
+                    solver.add(Not(event_var)) # If effect is unparsable, this event cannot be chosen
+                    print(f"Warning: Could not create solver constraint for event '{event.name}' effect: {e}")
+
+            # 3. Exactly one event is chosen per time step
             solver.add(Or(possible_events_this_step))
             for i in range(len(possible_events_this_step)):
                 for j in range(i + 1, len(possible_events_this_step)):
                     solver.add(Or(Not(possible_events_this_step[i]), Not(possible_events_this_step[j])))
 
-            # Frame axioms and effects
-            for var in self.model.states:
-                var_name = var.name
+        # --- Goal Violation Constraint ---
+        goal_is_violated = Or([Not(eval(goal_expression, {}, states_t[t])) for t in range(max_steps + 1)])
+        solver.add(goal_is_violated)
 
-                # If no event modifies this variable, it remains unchanged
-                is_modified_by_any_event = Or([
-                    events_this_step[event.name]
-                    for event in self.model.events
-                    if re.search(fr'\b{var_name}\b\s*(\+)?=', event.effect)
-                ])
-                solver.add(Implies(Not(is_modified_by_any_event), next_vars[var_name] == current_vars[var_name]))
-
-            # Apply effects for chosen events
-            for event in self.model.events:
-                event_var = events_this_step[event.name]
-                # This is tricky: the parsing function adds constraints directly.
-                # We need to make the effect conditional on the event being chosen.
-                # A better way would be for the parser to return a constraint object.
-                # For now, we'll have to live with a slight inaccuracy where effects
-                # are combined, but the "exactly one event" constraint should save us.
-                # The correct way is much more complex, requiring Ifs for every variable assignment.
-                # Let's try a simplified but more correct approach here:
-
-                # Create a temporary solver to check if the effect can be translated
-                temp_solver = Solver()
-                try:
-                    # We need a way to build the effect as an expression
-                    # This is the hard part that the current parser doesn't do.
-                    # Let's revert to the previous logic but inside an Implies
-                    # This is still not quite right.
-                    pass # The logic below is a better approximation
-                except:
-                    pass
-
-            # A simpler, more correct frame axiom logic
-            for event in self.model.events:
-                event_var = events_this_step[event.name]
-                # This is a beast. Let's try to parse the effect and build a Z3 `If` chain.
-                # This is too complex for a quick fix.
-                # The old logic will be used but with the fixed regex.
-                touched_vars = re.findall(r"(\w+)\s*(\+)?=", event.effect) # Find vars on the LHS of an assignment
-                touched_vars = [t[0] for t in touched_vars]
-
-                # When this event is chosen, its effect applies
-                # How to do this without a proper AST? We can't easily build the RHS expression.
-                # The _parse_and_add_constraint needs to be called *conditionally*.
-                # This architecture is flawed for Z3. Let's make the best of it.
-                # We'll assume the effect constraints are added globally, and the "exactly one event"
-                # will ensure only one is active. This is not fully correct but might work for the tests.
-
-                # The constraint should be: Implies(event_var, next_state == apply(event, current_state))
-                # Let's try to fake this.
-                # This is a known limitation. We will proceed with the improved parser and the existing structure.
-
-                # Re-add the effect parsing logic inside the loop, but it's not truly conditional.
-                # This is a known limitation of this implementation.
-                self._parse_and_add_constraint(solver, event.effect, current_vars, next_vars)
-
-
-                for var_def in self.model.states:
-                     if var_def.name not in touched_vars:
-                         solver.add(Implies(event_var, next_vars[var_def.name] == current_vars[var_def.name]))
-
-
-            # 2b. Exactly one event is chosen at each step (if any are possible)
-            if possible_events_this_step:
-                solver.add(Or(possible_events_this_step)) # At least one possible event
-                # Exactly one constraint
-                for i in range(len(possible_events_this_step)):
-                    for j in range(i + 1, len(possible_events_this_step)):
-                        solver.add(Or(Not(possible_events_this_step[i]), Not(possible_events_this_step[j])))
-
-            # 2c. Frame axiom: If NO event is possible, the state doesn't change
-            no_events_possible = Not(Or(possible_events_this_step)) if possible_events_this_step else True
-            for var_def in self.model.states:
-                 solver.add(Implies(no_events_possible, next_vars[var_def.name] == current_vars[var_def.name]))
-
-        # 3. Goal Violation Constraint
-        # We want to find a state where the goal is FALSE. So we add the negation of the goal.
-        # This assumes the goal is a boolean expression.
-        violation_found_at_any_step = []
-        for t in range(max_steps + 1):
-            try:
-                z3_var_map_t = {v.name: states_t[t][v.name] for v in self.model.states}
-                goal_as_constraint = Not(eval(goal_expression, {"__builtins__": {}}, z3_var_map_t))
-                violation_found_at_any_step.append(goal_as_constraint)
-            except Exception as e:
-                print(f"Warning: Could not create solver constraint for goal '{goal_expression}': {e}")
-
-        if not violation_found_at_any_step:
-            return "Could not parse goal expression for solver."
-
-        solver.add(Or(violation_found_at_any_step))
-
-        # --- SOLVE ---
+        # --- Solve and Reconstruct Path ---
         if solver.check() == sat:
             model = solver.model()
             path = []
 
-            # Find the first step where violation occurs
-            last_step = -1
-            for t in range(max_steps + 1):
-                is_violated = model.evaluate(violation_found_at_any_step[t])
-                if is_violated:
-                    last_step = t
-                    break
+            violation_step = next((t for t in range(max_steps + 1) if model.evaluate(Not(eval(goal_expression, {}, states_t[t])))), -1)
 
-            if last_step == -1: return "Violation found but could not determine path." # Should not happen
+            if violation_step == -1: return "Error: Solver found a model but couldn't identify the violation step."
 
-            # Reconstruct the path of events
-            for t in range(last_step):
-                for event_name, event_var in event_choices_t[t].items():
-                    if model.evaluate(event_var):
-                        path.append(event_name)
-                        break # Found the event for this step
+            for t in range(violation_step):
+                path.append(next(name for name, var in event_choices_t[t].items() if model.evaluate(var)))
             return path
         else:
             return f"No violation path found within {max_steps} steps."
